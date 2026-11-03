@@ -235,6 +235,26 @@ still smoothed. A replacement texture is read at the place of the original's
 mapping at its own resolution, a smaller copy where a pixel spans more than one
 of its texels.
 
+A replacement's alpha is kept in its own 8 bits while the 3D is drawn in 8
+(HD textures drawn: `fine`), not cut to the DS's 5, so a soft texture -- a
+swing's trail, a hit's flash, a glow -- fades smoothly instead of in 32 steps
+(`raster3d.hlsl` `FINE_ALPHA`). Only the weight of the blend is finer: a
+translucent pixel takes (a8 + 1) / 256 of the polygon's colour where the DS
+takes (a + 1) / 32, a8 the texel's and the polygon's alpha multiplied at 8 bits
+as the DS multiplies them at 6 (a polygon alpha `a` is a * 8 + 7: the two
+weights are the same at the DS's steps), and a decal's texture lies over the
+vertex colour by its 8-bit alpha. Everything that decides what is seen stays
+the DS's, from the top 5 bits of the same alpha: whether a pixel shows (alpha 0,
+the alpha test against `ALPHA_TEST_REF`), whether it is opaque or translucent,
+the translucent polygon IDs, the depth a translucent pixel writes, fog and
+edge marking, and the 3D layer's alpha in its pixel (0-31), which the 2D
+composition blends with -- over the 2D layers a soft texture still has the
+DS's steps. The game's own textures, and the replacements when the 3D is drawn
+in the DS's 6 bits (`KHDAYS_GFX=check`'s old way), are drawn exactly as
+before; with texture smoothing the 5 bits are taken from the four texels'
+8-bit alpha blended, so a smoothed cut-out's edge can fall a step from where
+5-bit texels put it.
+
 The replacement graphics (`runtime/mods/textures.h`: mods' 3D textures, 2D tile
 sheets, models' textures) share one buffer the 3D pass and the 2D composition
 both read (SDL's GPU API binds at most 8 storage buffers to a pass): a table of
@@ -257,8 +277,9 @@ blends at the port's resolution").
 Testing knobs: `KHDAYS_SHOTS_HD=DIR` (the `KHDAYS_SHOTS` frames as presented,
 at the resolution drawn); `KHDAYS_GFX=reference` (the 2D engines' pictures);
 `KHDAYS_GFX=check` (the port's way compared with the 2D engines at 1x, or the
-old way at N x, every 300 frames); `KHDAYS_PROFILE` (frames never drawn, and
-the time preparing the 3D took).
+old way at N x, every 300 frames); `KHDAYS_HD_ALPHA=5` (replacements' alpha
+in the DS's 5 bits, as before `FINE_ALPHA`, to compare); `KHDAYS_PROFILE`
+(frames never drawn, and the time preparing the 3D took).
 
 ## Mods' graphics
 

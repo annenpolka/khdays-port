@@ -765,6 +765,19 @@ void khdays_raster3d_use_list(const KhdaysG3dList *list)
     list_instead = list;
 }
 
+/* Whether a replacement's alpha is drawn in its own 8 bits when the 3D is (`fine`: HD textures drawn),
+ * so soft effects fade smoothly; which pixels show stays the DS's (raster3d.hlsl FINE_ALPHA).
+ * KHDAYS_HD_ALPHA=5 keeps the DS's 5 bits, to compare. */
+static int fine_alpha(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = SDL_getenv("KHDAYS_HD_ALPHA");
+        on = v == NULL || SDL_strcmp(v, "5") != 0;
+    }
+    return on;
+}
+
 static int draw(const KhdaysFramePackage *p, int scale, int texture_smoothing, int compose_too)
 {
     const KhdaysG3dList *list = list_instead != NULL ? list_instead : &p->list3d;
@@ -945,7 +958,8 @@ static int draw(const KhdaysFramePackage *p, int scale, int texture_smoothing, i
         rp.alpha_ref = io3d[0x40];
         rp.clear_color = io32(io3d, 0x50);
         rp.clear_depth = io32(io3d, 0x54);
-        rp.smooth = (uint32_t)(texture_smoothing != 0) | (stretched ? 2u : 0u); /* the shader's pixel_art flags */
+        /* the shader's pixel_art flags, and the replacements' alpha in 8 bits (FINE_ALPHA) */
+        rp.smooth = (uint32_t)(texture_smoothing != 0) | (stretched ? 2u : 0u) | (fine && fine_alpha() ? 4u : 0u);
         rp.origin_x = origin_x;
         rp.fine = (uint32_t)fine;
         rp.npolys = (uint32_t)list->npolys;

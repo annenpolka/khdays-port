@@ -46,7 +46,8 @@ cbuffer Params : register(b0, space2) {
     uint alpha_ref;   // ALPHA_TEST_REF
     uint clear_color; // CLEAR_COLOR
     uint clear_depth; // CLEAR_DEPTH, CLRIMAGE_OFFSET << 16
-    uint smooth;      // bit 0: texture smoothing (not the DS's); bit 1: screen space stretched to the target
+    uint smooth;      // bit 0: texture smoothing (not the DS's); bit 1: screen space stretched to the target;
+                      // bit 2: replacements' alpha in 8 bits (FINE_ALPHA, not the DS's 5)
     int origin_x;     // the DS column of the target's first column (0 at 4:3)
     uint fine;        // 1: colours in 8 bits a channel (HD textures drawn), not the DS's 6
     uint npolys;      // what the host uploaded: no polygon, vertex or tile entry past them is read
@@ -283,13 +284,19 @@ float wrapf(float c, float size, uint repeat, uint flip)
     return c - floor(c / size) * size;
 }
 
-// One of the replacement's texels: 6-bit RGB in xyz, alpha 0-31 in w.
+// A replacement's alpha in its own 8 bits (the port's, not the DS's: gpu_raster3d.c sets it with `fine`),
+// so a soft texture -- a swing's trail, a hit's flash -- fades smoothly instead of in the DS's 32 steps.
+// Only how much of the colour a pixel takes is finer (plot's `a8`); whether it shows, and whether it is
+// opaque or translucent, is still the DS's alpha: the top 5 bits.
+static const uint FINE_ALPHA = 4u; // in `smooth`
+
+// One of the replacement's texels: 6-bit RGB in xyz (8 when fine), alpha 0-31 in w (0-255 with FINE_ALPHA).
 int4 hd_at(uint4 e, int x, int y)
 {
     const uint c = hd.Load((e.x + (uint)y * e.y + (uint)x) * 4u);
     const uint cut = fine != 0u ? 0u : 2u;
     return int4((int)((c & 255u) >> cut), (int)(((c >> 8) & 255u) >> cut), (int)(((c >> 16) & 255u) >> cut),
-                (int)((c >> 24) >> 3));
+                (int)((c >> 24) >> ((smooth & FINE_ALPHA) != 0u ? 0u : 3u)));
 }
 
 // A still picture's smaller copies follow its texels, each half the one before
@@ -320,7 +327,7 @@ int hd_levels(uint4 e)
 // Level `l` (an entry from hd_level) of polygon `p`'s replacement at (u, v),
 // its own texels: the four around it, alpha-weighted (as smoothed_texel), only
 // the polygon's own texels (polygon_texels) when they lie within one period of
-// the texture. Colour 0-255 or 0-63 (fine) in xyz, alpha 0-31 in w.
+// the texture. Colour 0-255 or 0-63 (fine) in xyz, alpha as hd_at's in w.
 float4 hd_blend(Polygon p, uint4 l, float u, float v, float ss, float ts)
 {
     const uint rs = (p.tex >> 16) & 1u, rt = (p.tex >> 17) & 1u, fs = (p.tex >> 18) & 1u, ft = (p.tex >> 19) & 1u;
@@ -348,7 +355,7 @@ float4 hd_blend(Polygon p, uint4 l, float u, float v, float ss, float ts)
 
 // Polygon `p`'s replacement at (s, t), the original's texels: the same place of the original's
 // mapping at the replacement's resolution, nearest or smoothed; a smaller copy where a pixel spans more
-// than one texel (`footprint`). Colours in 8 bits when `fine`, else cut to the DS's 6.
+// than one texel (`footprint`). Colours in 8 bits when `fine`, else cut to the DS's 6; alpha as hd_at's.
 int4 hd_texel(Polygon p, float s, float t, float footprint)
 {
     const uint r4 = (uint)p.replacement * 4u;
@@ -379,7 +386,8 @@ int4 hd_texel(Polygon p, float s, float t, float footprint)
         if (c.w <= 0.0f) {
             return int4(0, 0, 0, 0);
         }
-        return int4((int3)min(round(c.xyz), fine != 0u ? 255.0f : 63.0f), (int)min(round(c.w), 31.0f));
+        return int4((int3)min(round(c.xyz), fine != 0u ? 255.0f : 63.0f),
+                    (int)min(round(c.w), (smooth & FINE_ALPHA) != 0u ? 255.0f : 31.0f));
     }
 }
 
@@ -552,6 +560,8 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
     const uint mode = (p.attr >> 4) & 3u;
     const uint id = (p.attr >> 24) & 63u;
     int alpha = (int)((p.attr >> 16) & 31u);
+    // the polygon's alpha in 8 bits for FINE_ALPHA, widened as expand_alpha widens it to 6 (the low bits set)
+    int alpha8 = alpha != 0 ? alpha * 8 + 7 : 0;
     // the vertex colour, 6 bits as the DS's (or scaled to 8 when fine)
     const float vscale = fine != 0u ? 255.0f / 63.0f : 1.0f;
     const int cmax = fine != 0u ? 255 : 63;
@@ -560,6 +570,8 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
     precise float bf = at.b * w * vscale + 0.5f;
     int rv = (int)rf, gv = (int)gf, bv = (int)bf;
     int r, gg, b, a;
+    int a8 = 0;               // with fine_alpha, `a` in 8 bits: how much of the colour a translucent pixel takes
+    bool fine_alpha = false;  // the texel is a replacement's, its alpha kept in 8 bits (FINE_ALPHA)
     bool pass;
     if (mode == 3u && id == 0u) {  // a run of shadow masks starts from a clear stencil
         if (px.mask_run == 0u) px.stencil = 0u;
@@ -570,9 +582,12 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
     if (alpha == 0) {  // wire-frame: only the edges, solid
         if (edge == 0u) return;
         alpha = 31;
+        alpha8 = 255;
     } else if (((uint)p.flags & G3D_MOD) != 0u) {
         // a mod's vertex alpha, blended across the polygon
-        alpha = (int)((float)alpha * saturate(at.a * w) + 0.5f);
+        const float vertex_alpha = saturate(at.a * w);
+        alpha = (int)((float)alpha * vertex_alpha + 0.5f);
+        alpha8 = (int)((float)alpha8 * vertex_alpha + 0.5f);
         if (alpha == 0) return;
     }
     rv = clamp(rv, 0, cmax);
@@ -604,10 +619,11 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
 
     {
         const uint format = (p.tex >> 26) & 7u;
-        int rt = cmax, gt = cmax, bt = cmax, at6 = 63, at5 = 31;
+        int rt = cmax, gt = cmax, bt = cmax, at6 = 63, at5 = 31, at8 = 255;
         const int unit = fine != 0u ? 256 : 64; // the modulation's divisor
         const int av6 = expand_alpha(alpha);
         const bool textured = format != 0u && (disp3dcnt & 1u) != 0u;
+        fine_alpha = textured && p.replacement >= 0 && (smooth & FINE_ALPHA) != 0u;
         if (textured) {
             precise float sf = at.s * w / 16.0f;
             precise float tf = at.t * w / 16.0f;
@@ -616,7 +632,9 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
                 rt = c.x;
                 gt = c.y;
                 bt = c.z;
-                at5 = c.w;
+                // the DS's alpha: the top 5 bits, as hd_at keeps them without FINE_ALPHA
+                at5 = fine_alpha ? c.w >> 3 : c.w;
+                at8 = fine_alpha ? c.w : 255;
             } else {
                 const uint tx = (smooth & 1u) != 0u && !pixel_art(p) ? smoothed_texel(p.tex, p.pltt, sf, tf, polygon_texels(p))
                                              : texel(p.tex, p.pltt, (int)floor(sf), (int)floor(tf));
@@ -628,7 +646,11 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
             at6 = expand_alpha(at5);
         }
         if (mode == 1u && textured) {  // decal
-            if (at5 == 0) { r = rv; gg = gv; b = bv; }
+            if (fine_alpha) {  // the texture over the vertex colour by its 8-bit alpha (all of it at 255)
+                r = (rt * at8 + rv * (255 - at8)) / 255;
+                gg = (gt * at8 + gv * (255 - at8)) / 255;
+                b = (bt * at8 + bv * (255 - at8)) / 255;
+            } else if (at5 == 0) { r = rv; gg = gv; b = bv; }
             else if (at5 == 31) { r = rt; gg = gt; b = bt; }
             else if (fine != 0u) {
                 r = (rt * at5 + rv * (31 - at5)) / 31;
@@ -640,6 +662,7 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
                 b = (bt * at5 + bv * (63 - at5)) / 64;
             }
             a = av6;
+            a8 = alpha8;
         } else if (mode == 2u) {  // toon / highlight: the red component indexes the table
             const uint t16 = toon_entry((uint)(rv >> 1));
             const int rs = channel5((int)(t16 & 31u)), gs = channel5((int)((t16 >> 5) & 31u)),
@@ -653,14 +676,20 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
                 b = min(b + bs, cmax);
             }
             a = ((at6 + 1) * (av6 + 1) - 1) / 64;
+            a8 = ((at8 + 1) * (alpha8 + 1) - 1) / 256;
         } else {  // modulation (and shadow)
             r = ((rt + 1) * (rv + 1) - 1) / unit;
             gg = ((gt + 1) * (gv + 1) - 1) / unit;
             b = ((bt + 1) * (bv + 1) - 1) / unit;
             a = ((at6 + 1) * (av6 + 1) - 1) / 64;
+            a8 = ((at8 + 1) * (alpha8 + 1) - 1) / 256; // the DS's product at 8 bits, as the colours' when fine
         }
         a >>= 1;  // back to 5 bits
     }
+    // With FINE_ALPHA too, the alpha test, the translucent IDs and which pixels are opaque go by `a`, the
+    // DS's 5 bits; `a8` only weighs the blend below: (a8 + 1) / 256 of the colour where the DS takes
+    // (a + 1) / 32. The two are the same for a8 = a * 8 + 7, which a texel or polygon alpha of the DS's
+    // steps gives when the other is opaque.
     // alpha test
     if ((disp3dcnt & 4u) != 0u ? a <= (int)(alpha_ref & 31u) : a == 0) {
         return;
@@ -674,9 +703,15 @@ void plot(Polygon p, inout Pixel px, Attrs at, uint edge, uint wbuffer)
             return;
         }
         if ((disp3dcnt & 8u) != 0u && px.a > 0) {
-            px.r = (r * (a + 1) + px.r * (31 - a)) / 32;
-            px.g = (gg * (a + 1) + px.g * (31 - a)) / 32;
-            px.b = (b * (a + 1) + px.b * (31 - a)) / 32;
+            if (fine_alpha) {
+                px.r = (r * (a8 + 1) + px.r * (255 - a8)) / 256;
+                px.g = (gg * (a8 + 1) + px.g * (255 - a8)) / 256;
+                px.b = (b * (a8 + 1) + px.b * (255 - a8)) / 256;
+            } else {
+                px.r = (r * (a + 1) + px.r * (31 - a)) / 32;
+                px.g = (gg * (a + 1) + px.g * (31 - a)) / 32;
+                px.b = (b * (a + 1) + px.b * (31 - a)) / 32;
+            }
             if (a > px.a) px.a = a;
         } else {
             px.r = r;
